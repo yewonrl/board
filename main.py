@@ -1,123 +1,278 @@
+
 import json
+import re
+from io import BytesIO
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
 
-# 페이지 설정
-st.set_page_config(page_title="전국 고령화 단계구분도 (2026년)", layout="wide")
+
+# --------------------------------------------------
+# 기본 설정
+# --------------------------------------------------
+st.set_page_config(
+    page_title="전국 고령화 단계구분도",
+    page_icon="🗺️",
+    layout="wide",
+)
+
+POPULATION_URL = (
+    "https://raw.githubusercontent.com/yewonrl/borad//main/"
+    "population_ts_yearly_gender.zip"
+)
+GEOJSON_URL = (
+    "https://raw.githubusercontent.com/yewonrl/board//main/"
+    "sigungu_kr.geojson"
+)
+
+st.title("전국 시군구 고령화 단계구분도")
+st.caption("2026년 6월 기준 · 65세 이상 인구 비율 · 시군구 코드 기준")
 
 
-# 데이터 로드 (캐싱을 통해 속도 optimiized)
-@st.cache_data
+# --------------------------------------------------
+# 데이터 다운로드 및 로딩
+# --------------------------------------------------
+@st.cache_data(show_spinner="인구 데이터와 행정구역 경계를 불러오는 중...")
 def load_data():
-    # 1. 인구 데이터 불러오기 (압축 Zip CSV)
-    pop_url = "https://raw.githubusercontent.com/yewonrl/contents//main/population_ts_yearly_gender.zip"
-    df = pd.read_csv(pop_url, compression="zip")
+    # 압축 CSV 읽기
+    pop_response = requests.get(POPULATION_URL, timeout=120)
+    pop_response.raise_for_status()
 
-    # 코드를 문자열로 변환하고 8자리(앞의 0 보장) 지정
-    df["코드"] = df["코드"].astype(str).str.zfill(8)
+    population = pd.read_csv(
+        BytesIO(pop_response.content),
+        compression="zip",
+        dtype={"코드": "string"},
+        low_memory=False,
+    )
 
-    # 2026년 데이터 필터링
-    df_2026 = df[df["연도"] == 2026].copy()
+    # GeoJSON 읽기
+    geo_response = requests.get(GEOJSON_URL, timeout=120)
+    geo_response.raise_for_status()
+    geojson = geo_response.json()
 
-    # 시군구 코드 추출 (앞 5자리)
-    df_2026["sigungu_code"] = df_2026["코드"].str[:5]
+    # 코드 형식을 문자열로 통일하고 앞자리 0 보존
+    population["코드"] = (
+        population["코드"]
+        .astype("string")
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+        .str.zfill(10)
+    )
 
-    # '계_'로 시작하는 컬럼만 추출 (전체 인구용)
-    total_cols = [col for col in df_2026.columns if col.startswith("계_")]
+    # 2026년 데이터만 사용
+    population["연도"] = pd.to_numeric(
+        population["연도"], errors="coerce"
+    )
+    population = population.loc[
+        population["연도"].eq(2026)
+    ].copy()
 
-    # 65세 이상 컬럼 추출 ('계_65세' ~ '계_100세 이상')
-    over65_cols = []
-    for col in total_cols:
-        age_str = col.replace("계_", "").replace("세", "").replace(" 이상", "")
-        if age_str.isdigit() and int(age_str) >= 65:
-            over65_cols.append(col)
+    if population.empty:
+        raise ValueError("인구 데이터에서 2026년 자료를 찾을 수 없습니다.")
 
-    # 행별 총인구 및 65세 이상 인구 계산
-    df_2026["총인구"] = df_2026[total_cols].sum(axis=1)
-    df_2026["고령인구"] = df_2026[over65_cols].sum(axis=1)
+    # 계_로 시작하는 열만 사용. 남_ / 여_ 열은 합산하지 않음.
+    total_cols = [
+        c for c in population.columns
+        if c.startswith("계_")
+    ]
 
-    # 시군구(앞 5자리) 단위 집계
+    # 계_65세 ~ 계_99세 및 계_100세 이상
+    elderly_cols = [
+        c for c in total_cols
+        if (
+            re.fullmatch(r"계_(?:[6-9]\d|100)세", c)
+            and int(c.split("_")[1][:-1]) >= 65
+        ) or c == "계_100세 이상"
+    ]
+
+    if not total_cols:
+        raise ValueError("'계_'로 시작하는 인구 열이 없습니다.")
+
+    if not elderly_cols:
+        raise ValueError("65세 이상 인구 열을 찾을 수 없습니다.")
+
+    # 문자열 숫자도 안전하게 숫자로 변환
+    for col in set(total_cols):
+        population[col] = pd.to_numeric(
+            population[col], errors="coerce"
+        ).fillna(0)
+
+    population["전체인구"] = population[total_cols].sum(axis=1)
+    population["65세이상인구"] = population[elderly_cols].sum(axis=1)
+
+    # 동 코드 앞 5자리로 시군구 집계
+    population["시군구코드"] = population["코드"].str[:5]
+
     grouped = (
-        df_2026.groupby("sigungu_code")[["총인구", "고령인구"]]
-        .sum()
-        .reset_index()
+        population.groupby("시군구코드", as_index=False)
+        .agg(
+            전체인구=("전체인구", "sum"),
+            **{"65세이상인구": ("65세이상인구", "sum")},
+        )
     )
 
-    # 고령화율(%) 계산
     grouped["고령화율"] = np.where(
-        grouped["총인구"] > 0,
-        (grouped["고령인구"] / grouped["총인구"]) * 100,
-        0,
-    )
-    grouped["고령화율"] = grouped["고령화율"].round(2)
-
-    # 2. GeoJSON 데이터 불러오기 (requests)
-    geojson_url = "https://raw.githubusercontent.com/first2022-cyber/contents//main/sigungu_kr.geojson"
-    res = requests.get(geojson_url)
-    geojson_data = res.json()
-
-    # GeoJSON의 '코드' 속성을 문자열 5자리로 정렬
-    for feature in geojson_data["features"]:
-        feature["properties"]["코드"] = str(
-            feature["properties"]["코드"]
-        ).zfill(5)
-
-    # 마우스 오버 시 표시할 시군구 및 시도 이름 매핑
-    geo_properties = [f["properties"] for f in geojson_data["features"]]
-    geo_df = pd.DataFrame(geo_properties)
-    geo_df["코드"] = geo_df["코드"].astype(str).str.zfill(5)
-
-    # 결합
-    final_df = pd.merge(
-        grouped,
-        geo_df[["코드", "시도", "시군구"]],
-        left_on="sigungu_code",
-        right_on="코드",
-        how="inner",
+        grouped["전체인구"] > 0,
+        grouped["65세이상인구"] / grouped["전체인구"] * 100,
+        np.nan,
     )
 
-    return final_df, geojson_data
+    # GeoJSON의 코드도 문자열로 정규화
+    for feature in geojson.get("features", []):
+        props = feature.get("properties", {})
+        code = str(props.get("코드", "")).strip()
+        code = re.sub(r"\.0$", "", code)
+        props["코드"] = code.zfill(5)
+
+    # GeoJSON의 코드가 지도 결합 키
+    rate_by_code = grouped.set_index("시군구코드")["고령화율"].to_dict()
+
+    for feature in geojson["features"]:
+        props = feature["properties"]
+        props["고령화율"] = rate_by_code.get(props["코드"])
+
+    # 지도와 표에 사용할 시군구 자료
+    properties = pd.DataFrame([
+        {
+            "코드": f["properties"]["코드"],
+            "시군구": f["properties"].get("시군구", ""),
+            "시도": f["properties"].get("시도", ""),
+            "고령화율": f["properties"].get("고령화율"),
+        }
+        for f in geojson["features"]
+    ])
+
+    result = properties.merge(
+        grouped.rename(columns={"시군구코드": "코드"}),
+        on="코드",
+        how="left",
+        suffixes=("", "_집계"),
+    )
+
+    return geojson, result
 
 
-# UI 구성
-st.title("🗺️ 2026년 전국 시군구별 고령화 단계구분도")
-st.markdown("전국 시군구별 65세 이상 고령인구 비율(%) 시각화 지도입니다.")
+try:
+    geojson, result = load_data()
+except Exception as exc:
+    st.error(f"데이터를 불러오거나 처리하지 못했습니다: {exc}")
+    st.info(
+        "원본 URL, CSV 열 이름, GeoJSON의 features/properties 구조를 "
+        "확인해 주세요."
+    )
+    st.stop()
 
-with st.spinner("데이터를 로딩하고 지도를 생성 중입니다..."):
-    df_map, geojson_kr = load_data()
 
-# Plotly Choropleth 생성
-fig = px.choropleth_mapbox(
-    df_map,
-    geojson=geojson_kr,
-    locations="sigungu_code",
+# --------------------------------------------------
+# 요약 지표
+# --------------------------------------------------
+valid = result.dropna(subset=["고령화율"]).copy()
+
+if valid.empty:
+    st.error(
+        "GeoJSON과 인구 데이터의 코드가 일치하지 않습니다. "
+        "두 파일의 코드 형식과 2026년 자료를 확인해 주세요."
+    )
+    st.stop()
+
+c1, c2, c3 = st.columns(3)
+c1.metric("매칭된 시군구", f"{len(valid):,}곳")
+c2.metric("평균 고령화율", f"{valid['고령화율'].mean():.2f}%")
+top = valid.loc[valid["고령화율"].idxmax()]
+c3.metric("고령화율 최고", f"{top['시군구']} · {top['고령화율']:.2f}%")
+
+
+# --------------------------------------------------
+# 단계구분도
+# --------------------------------------------------
+st.subheader("시군구별 65세 이상 인구 비율")
+
+fig = px.choropleth(
+    valid,
+    geojson=geojson,
+    locations="코드",
     featureidkey="properties.코드",
     color="고령화율",
-    color_continuous_scale="Reds",
-    range_color=(df_map["고령화율"].min(), df_map["고령화율"].max()),
-    mapbox_style="white-bg",  # 배경 타일 지도를 없애고 경계만 표시
-    center={"lat": 35.9, "lon": 127.8},
-    zoom=6.2,
+    color_continuous_scale="YlOrRd",
+    range_color=(0, max(1, float(valid["고령화율"].max()))),
     hover_name="시군구",
     hover_data={
-        "sigungu_code": False,
-        "시도": True,
-        "고령화율": ":.2f%",
-        "총인구": ":,명",
-        "고령인구": ":,명",
+        "코드": False,
+        "고령화율": ":.2f",
     },
-    labels={"고령화율": "고령화율(%)", "총인구": "총인구", "고령인구": "65세 이상 인구"},
+    labels={"고령화율": "고령화율 (%)"},
 )
 
-# 지역 경계선 및 레이아웃 설정
-fig.update_traces(marker_line_width=0.8, marker_line_color="gray")
+# 타일 배경 없이 GeoJSON 경계만 표시
+fig.update_geos(
+    visible=False,
+    fitbounds="locations",
+    showcountries=False,
+    showcoastlines=False,
+    showland=False,
+    showframe=False,
+    bgcolor="rgba(0,0,0,0)",
+)
+
+fig.update_traces(
+    marker_line_color="white",
+    marker_line_width=0.45,
+    hovertemplate=(
+        "<b>%{hovertext}</b><br>"
+        "고령화율: %{z:.2f}%"
+        "<extra></extra>"
+    ),
+)
+
 fig.update_layout(
-    margin={"r": 0, "t": 20, "l": 0, "b": 0},
-    height=750,
+    height=760,
+    margin=dict(l=0, r=0, t=20, b=0),
+    coloraxis_colorbar=dict(
+        title="고령화율 (%)",
+        ticksuffix="%",
+    ),
 )
 
-# 스트림릿 출력
 st.plotly_chart(fig, use_container_width=True)
+
+# --------------------------------------------------
+# 데이터 표
+# --------------------------------------------------
+st.subheader("시군구별 고령화율 데이터")
+
+search = st.text_input("시군구 검색", placeholder="예: 수원, 강남, 제주")
+table = valid[
+    ["코드", "시도", "시군구", "전체인구", "65세이상인구", "고령화율"]
+].copy()
+
+if search.strip():
+    mask = (
+        table["시도"].astype(str).str.contains(search, case=False, na=False)
+        | table["시군구"].astype(str).str.contains(search, case=False, na=False)
+        | table["코드"].astype(str).str.contains(search, case=False, na=False)
+    )
+    table = table.loc[mask]
+
+table = table.sort_values("고령화율", ascending=False)
+table["고령화율"] = table["고령화율"].round(2)
+
+st.dataframe(
+    table,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "전체인구": st.column_config.NumberColumn(format="%d"),
+        "65세이상인구": st.column_config.NumberColumn(format="%d"),
+        "고령화율": st.column_config.NumberColumn(format="%.2f%%"),
+    },
+)
+
+st.download_button(
+    "집계 결과 CSV 다운로드",
+    data=table.to_csv(index=False).encode("utf-8-sig"),
+    file_name="sigungu_aging_rate_2026.csv",
+    mime="text/csv",
+)
